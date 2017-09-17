@@ -3,7 +3,7 @@
 # project subdirectory.
 #
 
-PROJECT_NAME := app-template
+PROJECT_NAME := busyboard
 
 include $(IDF_PATH)/make/project.mk
 
