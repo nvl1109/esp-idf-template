@@ -9,6 +9,7 @@
 #define KPAD_MAX_ROW 10U
 #define KPAD_MAX_COL 10U
 #define KPAD_MAX_QUEUE 10U
+#define KPAD_BUF_SIZE 10U
 
 typedef enum keypad_err_t {
     KEYPAD_OK = 0,
@@ -43,6 +44,7 @@ struct keypad_config {
     uint8_t chars[KPAD_MAX_ROW][KPAD_MAX_COL];
     uint8_t special_key;
     struct keypad_special_seq special_seq[KPAD_MAX_ROW];
+    uint32_t special_timeout_ms;
     uint32_t sleep_delay_ms;
     // Private members
     keypad_state_t _state;
@@ -50,11 +52,15 @@ struct keypad_config {
     TaskHandle_t _taskhd;
     QueueHandle_t _data_queue;
     uint8_t _is_special;
+    uint8_t _key_buf[KPAD_BUF_SIZE];
+    uint8_t _key_buf_idx;
+    int _timer_group;
+    int _timer_idx;
 };
 
 int keypad_init(struct keypad_config *config);
 int keypad_start(struct keypad_config *config);
-int keypad_get_msg(struct keypad_config *config, struct keypad_message *msg);
+int keypad_get_msg(struct keypad_config *config, struct keypad_message *msg, uint32_t timeout_ms);
 int keypad_deinit(struct keypad_config *config);
 
 #endif /* __ESP32_KEYPAD_H__ */

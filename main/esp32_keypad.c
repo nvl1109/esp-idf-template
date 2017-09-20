@@ -19,7 +19,13 @@
 
 #define KEYPAD_TAG "KEYPAD"
 
+#define TIMER_DIVIDER   16               /*!< Hardware timer clock divider */
+#define TIMER_SCALE    (TIMER_BASE_CLK / TIMER_DIVIDER)  /*!< used to calculate counter value */
+#define TIMER_FINE_ADJ   (1.4*(TIMER_BASE_CLK / TIMER_DIVIDER)/1000000) /*!< used to compensate alarm value */
+#define TIMER_INTERVAL0_SEC   (3.4179)   /*!< test interval for timer 0 */
+
 static void _s_keypad_task_handler(void *arg);
+static uint8_t _s_keypad_scan(struct keypad_config *config);
 
 int keypad_init(struct keypad_config *config)
 {
@@ -27,6 +33,8 @@ int keypad_init(struct keypad_config *config)
     int i,j;
     gpio_config_t io_conf;
     uint64_t tmp_mask;
+    // For timer
+    timer_config_t tmr_cfg;
 
     if ((config->_state == KEYPAD_ST_INIT) ||
         (config->_state == KEYPAD_ST_IDLE) ||
@@ -85,9 +93,35 @@ int keypad_init(struct keypad_config *config)
         return KEYPAD_ERR;
     }
 
+    // Init timer
+    config->_timer_group = TIMER_GROUP_0;
+    config->_timer_idx = TIMER_0;
+    tmr_cfg.alarm_en = 1;
+    tmr_cfg.auto_reload = 0;
+    tmr_cfg.counter_dir = TIMER_COUNT_UP;
+    tmr_cfg.divider = TIMER_DIVIDER;
+    tmr_cfg.intr_type = TIMER_INTR_LEVEL;
+    tmr_cfg.counter_en = TIMER_PAUSE;
+    /*Configure timer*/
+    timer_init(config->_timer_group, config->_timer_idx, &tmr_cfg);
+    /*Stop timer counter*/
+    timer_pause(config->_timer_group, config->_timer_idx);
+    /*Load counter value */
+    timer_set_counter_value(config->_timer_group, config->_timer_idx, 0x00000000ULL);
+    /*Set alarm value*/
+    timer_set_alarm_value(config->_timer_group, config->_timer_idx, TIMER_INTERVAL0_SEC * TIMER_SCALE - TIMER_FINE_ADJ);
+    /*Enable timer interrupt*/
+    timer_enable_intr(config->_timer_group, config->_timer_idx);
+    /*Set ISR handler*/
+    timer_isr_register(config->_timer_group, config->_timer_idx, timer_group0_isr, (void*) config->_timer_idx, ESP_INTR_FLAG_IRAM, NULL);
+
     // Update state
     config->_state = KEYPAD_ST_INIT;
     config->_is_special = 0;
+
+    if (config->special_timeout_ms == 0) {
+        config->special_timeout_ms = 1000; // Default special timeout is 1s
+    }
 
     return KEYPAD_OK;
 }
@@ -101,7 +135,7 @@ int keypad_start(struct keypad_config *config)
         return KEYPAD_ERR;
     }
 
-    ret = xTaskCreate(_s_keypad_task_handler, "keypad", 2048, NULL, 10, &config->_taskhd);
+    ret = xTaskCreate(_s_keypad_task_handler, "keypad", 2048, (void *)config, 10, &config->_taskhd);
     if (pdPASS != ret) {
         ESP_LOGE(KEYPAD_TAG, "Task create FAILED");
         return KEYPAD_ERR;
@@ -126,18 +160,71 @@ int keypad_deinit(struct keypad_config *config)
     return KEYPAD_OK;
 }
 
-int keypad_get_msg(struct keypad_config *config, struct keypad_message *msg)
+int keypad_get_msg(struct keypad_config *config, struct keypad_message *msg, uint32_t timeout_ms)
 {
-
+    if (pdTRUE != xQueueReceive(config->_data_queue, msg, timeout_ms/portTICK_PERIOD_MS)) {
+        return KEYPAD_ERR;
+    }
     return KEYPAD_OK;
 }
 
 static void _s_keypad_task_handler(void *arg)
 {
-    while((config->_state == KEYPAD_ST_IDLE) || (config->_state == KEYPAD_ST_SCANNING)) {
-        // scan keypad
+    struct keypad_config *config = (struct keypad_config *)arg;
+    uint8_t ret;
 
+    while((config->_state == KEYPAD_ST_IDLE) || (config->_state == KEYPAD_ST_SCANNING)) {
         // delay
         vTaskDelay(config->sleep_delay_ms / portTICK_PERIOD_MS);
+
+        // scan keypad
+        ret = _s_keypad_scan(config);
+
+        if (ret == 0) continue;
+
+        if (ret == config->special_key) {
+            // Special key, wait for another character
+            config->_is_special = 1;
+            // Add to buf
+            config->_key_buf_idx = 0;
+            config->_key_buf[0] = ret;
+            // TODO: Start the timeout timer
+        } else {
+            // Normal key, send message to queue
+            struct keypad_message msg = {
+                .len = 1,
+                .msg = {ret},
+            };
+
+            if (pdTRUE != xQueueSend(config->_data_queue, &msg, 0)) {
+                ESP_LOGE(KEYPAD_TAG, "Queue is full");
+            }
+        }
     }
+}
+
+static uint8_t _s_keypad_scan(struct keypad_config *config)
+{
+    uint8_t ret = 0;
+    uint8_t i, j;
+    int val;
+
+    for (i = 0; i < config->row_num; ++i) {
+        // Set row pin
+        gpio_set_level(config->row_pins[i], 1);
+        vTaskDelay(1 / portTICK_PERIOD_MS);
+        for (j = 0; j < config->col_num; ++j) {
+            // Get col pin
+            val = gpio_get_level(config->col_pins[j]);
+            if (val != 0) {
+                // has button pressed
+                ret = config->chars[i][j];
+                break;
+            }
+        }
+        gpio_set_level(config->row_pins[i], 0);
+        if (0 != val) break;
+    }
+
+    retun ret;
 }
