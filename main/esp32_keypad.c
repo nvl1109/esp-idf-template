@@ -47,27 +47,29 @@ int keypad_init(struct keypad_config *config)
     }
 
     // Configure GPIO pins for ROWs
-    tmp_mask = 0;
-    for (i = 0; i < config->row_num; ++i) {
-        tmp_mask |= 1 << config->row_pins[i];
-    }
     //disable interrupt
     io_conf.intr_type = GPIO_PIN_INTR_DISABLE;
     //set as output mode
     io_conf.mode = GPIO_MODE_OUTPUT;
-    //bit mask of the pins that you want to set,e.g.GPIO18/19
-    io_conf.pin_bit_mask = tmp_mask;
     //disable pull-down mode
     io_conf.pull_down_en = 0;
     //disable pull-up mode
     io_conf.pull_up_en = 0;
     //configure GPIO with the given settings
+
+    tmp_mask = 0;
+    for (i = 0; i < config->row_num; ++i) {
+        tmp_mask |= (uint64_t)1 << config->row_pins[i];
+    }
+    io_conf.pin_bit_mask = tmp_mask;
+    ESP_LOGD(KEYPAD_TAG, "gpio_config ROWs, mask 0x%llx", tmp_mask);
     ret = gpio_config(&io_conf);
     if (ESP_OK != ret) {
         ESP_LOGE(KEYPAD_TAG, "Configure ROW pins failed");
         return KEYPAD_ERR;
     }
 
+    ESP_LOGD(KEYPAD_TAG, "gpio set level for ROWs");
     // Set all rows to LOW
     for (i = 0; i < config->row_num; ++i) {
         gpio_set_level(config->row_pins[i], 0);
@@ -76,13 +78,14 @@ int keypad_init(struct keypad_config *config)
     // Configure GPIO pins for COLs
     tmp_mask = 0;
     for (i = 0; i < config->col_num; ++i) {
-        tmp_mask |= 1 << config->col_pins[i];
+        tmp_mask |= (uint64_t)1 << config->col_pins[i];
     }
     //set as output mode
     io_conf.mode = GPIO_MODE_INPUT;
     io_conf.pin_bit_mask = tmp_mask;
     //Enable pull-down mode
     io_conf.pull_down_en = 1;
+    ESP_LOGD(KEYPAD_TAG, "gpio_config COLs, mask 0x%llx", tmp_mask);
     ret = gpio_config(&io_conf);
     if (ESP_OK != ret) {
         ESP_LOGE(KEYPAD_TAG, "Configure COL pins failed");
@@ -95,6 +98,7 @@ int keypad_init(struct keypad_config *config)
         ESP_LOGE(KEYPAD_TAG, "Create message queue failed");
         return KEYPAD_ERR;
     }
+    ESP_LOGD(KEYPAD_TAG, "create data queue done");
 
     // Init timer
     config->_timer_group = TIMER_GROUP_0;
@@ -107,16 +111,22 @@ int keypad_init(struct keypad_config *config)
     tmr_cfg.counter_en = TIMER_PAUSE;
     /*Configure timer*/
     timer_init(config->_timer_group, config->_timer_idx, &tmr_cfg);
+    ESP_LOGD(KEYPAD_TAG, "timer init done");
     /*Stop timer counter*/
     timer_pause(config->_timer_group, config->_timer_idx);
+    ESP_LOGD(KEYPAD_TAG, "timer pause done");
     /*Load counter value */
     timer_set_counter_value(config->_timer_group, config->_timer_idx, 0x00000000ULL);
+    ESP_LOGD(KEYPAD_TAG, "timer set value done");
     /*Set alarm value*/
     timer_set_alarm_value(config->_timer_group, config->_timer_idx, TIMER_INTERVAL0_SEC * TIMER_SCALE - TIMER_FINE_ADJ);
+    ESP_LOGD(KEYPAD_TAG, "timer set alarm done");
     /*Enable timer interrupt*/
     timer_enable_intr(config->_timer_group, config->_timer_idx);
+    ESP_LOGD(KEYPAD_TAG, "timer enable isr done");
     /*Set ISR handler*/
     timer_isr_register(config->_timer_group, config->_timer_idx, _s_timer_group0_isr, (void*) config, ESP_INTR_FLAG_IRAM, NULL);
+    ESP_LOGD(KEYPAD_TAG, "timer isr register done");
 
     // Update state
     config->_state = KEYPAD_ST_INIT;
@@ -138,11 +148,13 @@ int keypad_start(struct keypad_config *config)
         return KEYPAD_ERR;
     }
 
+    config->_state = KEYPAD_ST_IDLE;
     ret = xTaskCreate(_s_keypad_task_handler, "keypad", 2048, (void *)config, 10, &config->_taskhd);
     if (pdPASS != ret) {
         ESP_LOGE(KEYPAD_TAG, "Task create FAILED");
         return KEYPAD_ERR;
     }
+    ESP_LOGD(KEYPAD_TAG, "keypad task created");
 
     return KEYPAD_OK;
 }
@@ -165,6 +177,8 @@ int keypad_deinit(struct keypad_config *config)
 
 int keypad_get_msg(struct keypad_config *config, struct keypad_message *msg, uint32_t timeout_ms)
 {
+    if ((config->_state != KEYPAD_ST_IDLE) && (config->_state != KEYPAD_ST_SCANNING)) return KEYPAD_ERR;
+
     if (pdTRUE != xQueueReceive(config->_data_queue, msg, timeout_ms/portTICK_PERIOD_MS)) {
         return KEYPAD_ERR;
     }
@@ -175,6 +189,7 @@ static void _s_keypad_task_handler(void *arg)
 {
     struct keypad_config *config = (struct keypad_config *)arg;
     uint8_t ret;
+    ESP_LOGD(KEYPAD_TAG, "keypad_task started");
 
     while((config->_state == KEYPAD_ST_IDLE) || (config->_state == KEYPAD_ST_SCANNING)) {
         // delay
@@ -182,8 +197,9 @@ static void _s_keypad_task_handler(void *arg)
 
         // scan keypad
         ret = _s_keypad_scan(config);
-
         if (ret == 0) continue;
+
+        ESP_LOGD(KEYPAD_TAG, "~~~key: 0x%x, %c", ret, ret);
 
         if ((ret == config->special_key) && (!config->_is_special)) {
             // Special key, wait for another character
@@ -216,6 +232,9 @@ static void _s_keypad_task_handler(void *arg)
             }
         }
     }
+
+    ESP_LOGI(KEYPAD_TAG, "Keypad task finished.");
+    vTaskDelete(config->_taskhd);
 }
 
 static uint8_t _s_keypad_scan(struct keypad_config *config)
@@ -224,6 +243,7 @@ static uint8_t _s_keypad_scan(struct keypad_config *config)
     uint8_t i, j;
     int val = 0;
 
+    config->_state = KEYPAD_ST_SCANNING;
     for (i = 0; i < config->row_num; ++i) {
         // Set row pin
         gpio_set_level(config->row_pins[i], 1);
@@ -240,6 +260,7 @@ static uint8_t _s_keypad_scan(struct keypad_config *config)
         gpio_set_level(config->row_pins[i], 0);
         if (0 != val) break;
     }
+    config->_state = KEYPAD_ST_IDLE;
 
     return ret;
 }
