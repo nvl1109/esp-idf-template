@@ -14,6 +14,7 @@
 #include "freertos/event_groups.h"
 
 #include "driver/gpio.h"
+#include "driver/timer.h"
 
 #include "esp32_keypad.h"
 
@@ -26,11 +27,13 @@
 
 static void _s_keypad_task_handler(void *arg);
 static uint8_t _s_keypad_scan(struct keypad_config *config);
+static void IRAM_ATTR _s_timer_group0_isr(void *para);
+static void _s_timer_start(int group, int idx);
 
 int keypad_init(struct keypad_config *config)
 {
     int ret;
-    int i,j;
+    int i;
     gpio_config_t io_conf;
     uint64_t tmp_mask;
     // For timer
@@ -113,7 +116,7 @@ int keypad_init(struct keypad_config *config)
     /*Enable timer interrupt*/
     timer_enable_intr(config->_timer_group, config->_timer_idx);
     /*Set ISR handler*/
-    timer_isr_register(config->_timer_group, config->_timer_idx, timer_group0_isr, (void*) config->_timer_idx, ESP_INTR_FLAG_IRAM, NULL);
+    timer_isr_register(config->_timer_group, config->_timer_idx, _s_timer_group0_isr, (void*) config, ESP_INTR_FLAG_IRAM, NULL);
 
     // Update state
     config->_state = KEYPAD_ST_INIT;
@@ -182,13 +185,25 @@ static void _s_keypad_task_handler(void *arg)
 
         if (ret == 0) continue;
 
-        if (ret == config->special_key) {
+        if ((ret == config->special_key) && (!config->_is_special)) {
             // Special key, wait for another character
             config->_is_special = 1;
             // Add to buf
-            config->_key_buf_idx = 0;
             config->_key_buf[0] = ret;
-            // TODO: Start the timeout timer
+            config->_key_buf_idx = 1;
+            // Start the timeout timer
+            _s_timer_start(config->_timer_group, config->_timer_idx);
+            // Also process this key
+            struct keypad_message msg = {
+                .len = 1,
+                .msg = {ret},
+            };
+            if (pdTRUE != xQueueSend(config->_data_queue, &msg, 0)) {
+                ESP_LOGE(KEYPAD_TAG, "Queue is full");
+            }
+        } else if (config->_is_special) {
+            // Normal key after special key, still in special sequence
+            config->_key_buf[config->_key_buf_idx++] = ret;
         } else {
             // Normal key, send message to queue
             struct keypad_message msg = {
@@ -207,7 +222,7 @@ static uint8_t _s_keypad_scan(struct keypad_config *config)
 {
     uint8_t ret = 0;
     uint8_t i, j;
-    int val;
+    int val = 0;
 
     for (i = 0; i < config->row_num; ++i) {
         // Set row pin
@@ -226,5 +241,41 @@ static uint8_t _s_keypad_scan(struct keypad_config *config)
         if (0 != val) break;
     }
 
-    retun ret;
+    return ret;
+}
+
+static void IRAM_ATTR _s_timer_group0_isr(void *para)
+{
+    struct keypad_config *config = (struct keypad_config *) para;
+    uint32_t intr_status = TIMERG0.int_st_timers.val;
+    int timer_idx = config->_timer_idx;
+
+    if((intr_status & BIT(timer_idx)) && timer_idx == TIMER_0) {
+        /*Timer0 is an example that doesn't reload counter value*/
+        TIMERG0.hw_timer[timer_idx].update = 1;
+
+        /* We don't call a API here because they are not declared with IRAM_ATTR.
+           If we're okay with the timer irq not being serviced while SPI flash cache is disabled,
+           we can alloc this interrupt without the ESP_INTR_FLAG_IRAM flag and use the normal API. */
+        TIMERG0.int_clr_timers.t0 = 1;
+
+        // Timer timeout, send _key_buf to queue
+        struct keypad_message msg = {
+            .len = config->_key_buf_idx,
+        };
+        memcpy(msg.msg, config->_key_buf, config->_key_buf_idx);
+        config->_is_special = 0;
+        config->_key_buf_idx = 0;
+        xQueueSendFromISR(config->_data_queue, &msg, NULL);
+    }
+}
+
+static void _s_timer_start(int group, int idx)
+{
+    /*Load counter value */
+    timer_set_counter_value(group, idx, 0x00000000ULL);
+    /*Set alarm value*/
+    timer_set_alarm_value(group, idx, TIMER_INTERVAL0_SEC * TIMER_SCALE - TIMER_FINE_ADJ);
+    /*Start timer counter*/
+    timer_start(group, idx);
 }
